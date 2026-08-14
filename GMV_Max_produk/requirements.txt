@@ -1,0 +1,10 @@
+pandas
+gspread
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+pyarrow
+numpy
+duckdb
+minio
+python-dotenv
