@@ -13,6 +13,13 @@ from src.gmv_max_produk.utils.minio_client import (
     get_minio_client,
     get_sheet_watermarks,
     update_sheet_watermarks,
+    write_quarantine,
+    sync_error_manifest,
+)
+from src.gmv_max_produk.utils.transform_utils import (
+    NUMERIC_COLS,
+    PERCENT_COLS,
+    validate_and_normalize_raw,
 )
 from src.gmv_max_produk.ingestion.fetch_gmv_max_produk_gsheet import (
     fetch_gmv_max_produk,
@@ -48,9 +55,35 @@ def run_daily_etl():
     df_raw = fetch_gmv_max_produk(gc)
     print(f"[INGEST] Rows raw from GSheet: {len(df_raw)}")
 
+    # 4b) STEP 2: validate & normalize as early as possible (mixed-column
+    #     detection + date-error capture). Runs exactly once, before anything else.
+    
+    # buang baris tanpa id_campaign
+    df_raw = df_raw[df_raw["ID Campaign"].astype(str).str.strip() != ""]
+    df_valid, df_error, v_report = validate_and_normalize_raw(
+        df_raw, NUMERIC_COLS, percent_cols=PERCENT_COLS
+    )
+    print(
+        f"[VALIDATE] Rows valid: {len(df_valid)} | bad rows: {v_report['n_bad_rows']} "
+        f"(date errors: {v_report['n_date_errors']}) | blank rows dropped: {v_report['n_blank_rows']}"
+    )
+    if v_report["has_changes"]:
+        print(f"[VALIDATE] Corrupted/Shifted columns: {v_report['affected_columns']}")
+        print(
+            f"[VALIDATE] Affected date range: {v_report['first_affected_date']} "
+            f"---> {v_report['last_affected_date']}"
+        )
+
+    # STEP 3Q/6: sync error manifest EVERY run (append new open entries +
+    # resolve entries whose format has been fixed since the last run).
+    sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key)
+
+    if not df_error.empty:
+        write_quarantine(minio_client, minio_bucket, df_error, today_key, run_key)
+
     # 5) Bronze Transformation + per-sheet incremental filter
     df_bronze, sheet_max_dates = build_bronze_maxp(
-        df_raw, sheet_watermarks=watermark_map
+        df_valid, sheet_watermarks=watermark_map
     )
     print(f"[BRONZE] Rows bronze to load: {len(df_bronze)}")
 

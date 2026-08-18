@@ -124,6 +124,156 @@ def update_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: st
     print(f"[MINIO] Updated watermark JSON for {len(records)} sheet(s).")
 
 
+ERROR_MANIFEST_PATH = "error_list_watermark/error_manifest.json"
+FIX_MANIFEST_PREFIX = "fix_error_list_watermark"
+QUARANTINE_PREFIX = "quarantine"
+
+
+def write_quarantine(minio_client: Minio, bucket: str, df_error: pd.DataFrame, today_key: str, run_key: str):
+    """Saves bad rows to MinIO under quarantine/date=YYYYMMDD/<run_key>.parquet."""
+    if df_error.empty:
+        return
+
+    folder_path = f"{QUARANTINE_PREFIX}/date={today_key}/"
+    file_path = f"{folder_path}quarantine_{run_key}.parquet"
+
+    minio_client.put_object(bucket, folder_path, io.BytesIO(b""), length=0)
+
+    parquet_bytes = df_error.to_parquet(index=False, engine="pyarrow")
+    minio_client.put_object(
+        bucket,
+        file_path,
+        io.BytesIO(parquet_bytes),
+        length=len(parquet_bytes),
+        content_type="application/octet-stream",
+    )
+    print(f"[MINIO] Quarantine bad rows to: {file_path}")
+
+
+def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame, report: dict, today_key: str, run_key: str, manifest_path: str = ERROR_MANIFEST_PATH):
+    """Syncs the error manifest at error_list_watermark/error_manifest.json.
+
+    Runs EVERY run (even with empty df_error):
+      1. Reads current open entries.
+      2. Builds current-run entries from df_error grouped by
+         (sheet_name, creds, error_date) — the same grain as the watermark.
+      3. Resolves: open entries whose key is no longer detected this run are
+         removed from the manifest and written as fix records to
+         fix_error_list_watermark/date=YYYYMMDD/fix_<run_key>.json.
+      4. Refreshes open entries still detected this run with the latest
+         n_rows / affected_columns / path, and appends new open entries not
+         already present.
+      5. Writes the manifest back only if something changed (avoids creating
+         an empty file when there is nothing to do).
+    """
+    from src.gmv_max_produk.utils.transform_utils import parse_mixed_dates
+
+    now = datetime.now().isoformat()
+    quarantine_path = f"{QUARANTINE_PREFIX}/date={today_key}/quarantine_{run_key}.parquet"
+
+    current_entries = []
+    if not df_error.empty:
+        df_error = df_error.copy()
+        if "Tanggal" in df_error.columns:
+            df_error["_parsed_date"] = parse_mixed_dates(df_error["Tanggal"], return_date=False)
+            df_error["_error_date"] = df_error["_parsed_date"].dt.date.astype(str)
+            df_error["_error_date"] = df_error["_error_date"].where(
+                df_error["_parsed_date"].notna(), "INVALID_DATE"
+            )
+        else:
+            df_error["_error_date"] = "INVALID_DATE"
+
+        sn_col = "sheet_name" if "sheet_name" in df_error.columns else "creds"
+        cr_col = "creds" if "creds" in df_error.columns else sn_col
+
+        for (sheet_name, creds, error_date), idx in df_error.groupby([sn_col, cr_col, "_error_date"]).groups.items():
+            current_entries.append({
+                "sheet_name": str(sheet_name),
+                "creds": str(creds),
+                "error_date": str(error_date),
+                "affected_columns": list(report["affected_columns"]),
+                "n_rows": int(len(idx)),
+                "reported_at": now,
+                "path": quarantine_path,
+                "status": "open",
+            })
+
+    manifest_existed = True
+    try:
+        minio_client.stat_object(bucket, manifest_path)
+        response = minio_client.get_object(bucket, manifest_path)
+        data = json.loads(response.read().decode("utf-8"))
+        response.close()
+        response.release_conn()
+        open_records = [r for r in data.get("errors", []) if r.get("status") == "open"]
+    except S3Error as e:
+        if e.code in ["NoSuchKey", "AccessDenied"]:
+            open_records = []
+            manifest_existed = False
+        else:
+            raise e
+
+    current_keys = {(e["sheet_name"], e["creds"], e["error_date"]) for e in current_entries}
+
+    resolved = []
+    refreshed = {}
+    for rec in open_records:
+        key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("error_date")))
+        if key in current_keys:
+            refreshed[key] = rec
+        else:
+            resolved.append(rec)
+
+    # Fresh current-run entries always win: refresh n_rows / affected_columns /
+    # reported_at / path for keys that already exist, append brand-new keys.
+    for entry in current_entries:
+        refreshed[(entry["sheet_name"], entry["creds"], entry["error_date"])] = entry
+
+    remaining = list(refreshed.values())
+
+    # Detect changes by comparing serialized content so refreshed entries (same
+    # key, different n_rows / columns) are written back, not just appended ones.
+    new_payload = json.dumps({"errors": remaining}, ensure_ascii=False, sort_keys=True)
+    old_payload = json.dumps({"errors": open_records}, ensure_ascii=False, sort_keys=True)
+    changed = bool(resolved) or new_payload != old_payload
+    if not changed and not manifest_existed:
+        return
+
+    if resolved:
+        fix_folder = f"{FIX_MANIFEST_PREFIX}/date={today_key}/"
+        fix_path = f"{fix_folder}fix_{run_key}.json"
+        fixes = [{
+            "sheet_name": r["sheet_name"],
+            "creds": r["creds"],
+            "error_date": r["error_date"],
+            "affected_columns": r.get("affected_columns", []),
+            "resolved_at": now,
+            "path": r.get("path", ""),
+            "status": "fixed",
+        } for r in resolved]
+        minio_client.put_object(bucket, fix_folder, io.BytesIO(b""), length=0)
+        payload = json.dumps({"fixes": fixes}, ensure_ascii=False).encode("utf-8")
+        minio_client.put_object(
+            bucket,
+            fix_path,
+            io.BytesIO(payload),
+            length=len(payload),
+            content_type="application/json",
+        )
+        print(f"[MINIO] Resolved {len(fixes)} error entr(y/ies) -> fix record: {fix_path}")
+
+    payload = json.dumps({"errors": remaining}, ensure_ascii=False).encode("utf-8")
+    minio_client.put_object(
+        bucket,
+        manifest_path,
+        io.BytesIO(payload),
+        length=len(payload),
+        content_type="application/json",
+    )
+    if current_entries:
+        print(f"[MINIO] Synced {len(current_entries)} open error entr(y/ies) to {manifest_path}")
+
+
 def filter_by_sheet_watermark(df: pd.DataFrame, sheet_col: str, date_col: str, watermarks: dict) -> tuple[pd.DataFrame, dict]:
     """Per-sheet incremental filter on already-clean dates (Timestamp dtype).
 
