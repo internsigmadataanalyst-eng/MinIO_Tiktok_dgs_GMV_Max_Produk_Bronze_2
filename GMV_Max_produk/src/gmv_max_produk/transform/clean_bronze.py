@@ -54,6 +54,10 @@ def build_bronze_maxp(
     df = tiktok_maxp_clean.copy()
     df.columns = df.columns.map(to_snake_case)
 
+    # buang kolom dengan header kosong (sel header GSheet blank / hanya
+    # karakter yang di-strip to_snake_case) supaya schema BigQuery valid.
+    df = df.loc[:, df.columns != ""]
+
     # buang baris tanpa id_campaign
     df = df[df["id_campaign"].astype(str).str.strip() != ""]
 

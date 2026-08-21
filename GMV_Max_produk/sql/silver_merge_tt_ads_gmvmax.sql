@@ -1,4 +1,4 @@
-MERGE INTO database-sigma.SILVER_DB.silver_tt_ads_gmvmax T
+MERGE INTO database-sigma.Testing.silver_tt_ads_gmvmax T
 USING (
 
   WITH latest_raw AS (
@@ -15,7 +15,7 @@ USING (
             DATE(b.tanggal)
           ORDER BY b.snapshot_ts DESC, b.run_id DESC
         ) rn
-      FROM database-sigma.BRONZE_DB.bronze_maxp b
+      FROM database-sigma.Testing.bronze_maxp b
     )
     WHERE rn = 1
   ),
