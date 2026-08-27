@@ -2,25 +2,13 @@
 import uuid
 import hashlib
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Union
-
 import pandas as pd
 
 from src.gmv_max_produk.utils.transform_utils import (
-    # clean_numeric_columns,
     parse_mixed_dates,
     to_snake_case,
 )
 from src.gmv_max_produk.utils.minio_client import filter_by_sheet_watermark
-
-# NUMERIC_COLS = [
-#     "Biaya",
-#     "Pesanan (SKU)",
-#     "Biaya per pesanan",
-#     "Pendapatan kotor",
-#     "Impresi iklan produk",
-#     "Jumlah klik iklan produk",
-# ]
 
 def _canon(x):
     x = "" if pd.isna(x) else str(x).strip()
@@ -36,11 +24,6 @@ def build_bronze_maxp(
     Filter incremental per sheet_name berdasarkan watermark (sheet_watermarks).
     Output: (df siap di-load ke BRONZE_DB.bronze_gmv_max_produk, sheet_max_dates)
     """
-    # # numeric cleaning
-    # tiktok_maxp_clean = clean_numeric_columns(
-    #     gmv_max_produk_raw, NUMERIC_COLS, fillna_value=0
-    # )
-
     tiktok_maxp_clean = gmv_max_produk_raw.copy()
     # parse tanggal
     tiktok_maxp_clean["Tanggal"] = parse_mixed_dates(

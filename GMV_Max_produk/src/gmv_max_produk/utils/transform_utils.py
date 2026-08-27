@@ -3,7 +3,7 @@ import re
 
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, List, Union
+from typing import Any, List
 
 EXCEL_EPOCH = pd.Timestamp("1899-12-30")
 
