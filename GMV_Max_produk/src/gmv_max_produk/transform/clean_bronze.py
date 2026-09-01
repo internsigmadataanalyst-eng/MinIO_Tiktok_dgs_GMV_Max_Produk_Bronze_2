@@ -21,8 +21,9 @@ def build_bronze_maxp(
     """
     Dari raw GSheet → cleaning numeric + tanggal + snake_case,
     tambah snapshot_ts, snapshot_date, run_id, row_hash_raw.
-    Filter incremental per sheet_name berdasarkan watermark (sheet_watermarks).
-    Output: (df siap di-load ke BRONZE_DB.bronze_gmv_max_produk, sheet_max_dates)
+    Filter incremental per (creds,sheet_name,toko) berdasarkan watermark (sheet_watermarks).
+    Watermark grain is (creds, sheet_name, toko) — toko verbatim.
+    Output: (df siap di-load ke BRONZE_DB.bronze_gmv_max_produk, sheet_max_dates: {(creds,sheet_name,toko):iso})
     """
     tiktok_maxp_clean = gmv_max_produk_raw.copy()
     # parse tanggal
@@ -78,10 +79,14 @@ def build_bronze_maxp(
                 .astype(pd.Int64Dtype())
             )
 
-    # Filter incremental per sheet (creds-keyed) berdasarkan watermark
-    if "creds" in df.columns:
+    # Filter incremental per (creds,sheet_name,toko) — triple grain verbatim
+    if "creds" in df.columns and "sheet_name" in df.columns and "toko" in df.columns:
         df, sheet_max_dates = filter_by_sheet_watermark(
-            df, "creds", "tanggal", sheet_watermarks or {}
+            df, "creds", "sheet_name", "toko", "tanggal", sheet_watermarks or {}
+        )
+    elif "creds" in df.columns and "sheet_name" in df.columns:
+        df, sheet_max_dates = filter_by_sheet_watermark(
+            df, "creds", "sheet_name", "toko", "tanggal", sheet_watermarks or {}
         )
     else:
         sheet_max_dates = {}
