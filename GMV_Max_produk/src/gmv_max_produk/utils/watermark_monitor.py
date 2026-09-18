@@ -10,13 +10,11 @@ filter, which only picks up rows newer than each sheet's watermark — so sheets
 that are already caught up are naturally skipped.
 """
 import os
-import time
 
 import gspread
 import pandas as pd
-from gspread.exceptions import APIError
 
-from src.gmv_max_produk.utils.gsheet_client import get_gspread_client
+from src.gmv_max_produk.utils.gsheet_client import get_gspread_client, with_retry_on_429
 from src.gmv_max_produk.utils.minio_client import get_minio_client, get_sheet_watermarks
 from src.gmv_max_produk.utils.transform_utils import parse_mixed_dates, to_snake_case
 
@@ -35,18 +33,10 @@ def col_index_to_letter(idx: int) -> str:
     return letter
 
 
-def with_retry(func, *args, max_retries=3, base_delay=15, **kwargs):
+# Backwards-compatible alias for the shared 429 retry helper.
+def with_retry(func, *args, max_retries=4, base_delay=15, **kwargs):
     """Retry wrapper with linear backoff for Google Sheets API 429 rate limits."""
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except APIError as e:
-            if "429" in str(e) and attempt < max_retries - 1:
-                wait = base_delay * (attempt + 1)
-                print(f"[RETRY] Rate limited, waiting {wait}s before retry {attempt + 1}/{max_retries}...")
-                time.sleep(wait)
-            else:
-                raise
+    return with_retry_on_429(func, *args, max_retries=max_retries, delay=base_delay, **kwargs)
 
 
 def get_df_minimal(
@@ -65,7 +55,7 @@ def get_df_minimal(
 
     Uses a single batch_get call for all needed columns — one network round-trip.
     """
-    ws = sh.worksheet(actual_sheet_name)
+    ws = with_retry_on_429(sh.worksheet, actual_sheet_name)
     header_raw = with_retry(ws.row_values, header_row + 1)
     header_norm = [to_snake_case(c) for c in header_raw]
 
@@ -124,7 +114,7 @@ def _open_spreadsheets(sheet_registry: dict) -> dict:
     objects = {}
     for spreadsheet_key, _worksheet in sheet_registry.values():
         if spreadsheet_key not in objects:
-            objects[spreadsheet_key] = gc.open_by_key(os.getenv(spreadsheet_key))
+            objects[spreadsheet_key] = with_retry_on_429(gc.open_by_key, os.getenv(spreadsheet_key))
     return objects
 
 
